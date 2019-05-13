@@ -43,12 +43,25 @@ class OpenSSLConan(ConanFile):
     source_tgz = "https://www.openssl.org/source/openssl-%s.tar.gz" % version
     source_tgz_old = "https://www.openssl.org/source/old/1.0.2/openssl-%s.tar.gz" % version
 
+    @property
+    def _compiler_runtime(self):
+        """
+        settings.yml may not have compiler.runtime (e.g. for clang-cl)
+        :return: compiler.runtime setting value, or sane default (MD or MDd for Debug)
+        """
+        runtime = self.settings.get_safe("compiler.runtime")
+        if not runtime:
+            runtime = 'MDd' if self.settings.build_type == 'Debug' else 'MD'
+        return runtime
+
     def build_requirements(self):
         # useful for example for conditional build_requires
-        if self.settings.compiler == "Visual Studio":
-            self.build_requires("strawberryperl/5.26.0@conan/stable")
+        if tools.os_info.is_windows:
+            if not tools.which('perl'):
+                self.build_requires("strawberryperl/5.26.0@conan/stable")
             if not self.options.no_asm and self.settings.arch == "x86":
-                self.build_requires("nasm/2.13.01@conan/stable")
+                if not tools.which('nasm'):
+                    self.build_requires("nasm/2.13.01@conan/stable")
 
     def source(self):
         self.output.info("Downloading %s" % self.source_tgz)
@@ -91,6 +104,10 @@ class OpenSSLConan(ConanFile):
                 lib_path = "%s/%s.lib" % (zlib_info.lib_paths[0], zlib_info.libs[0])
             else:
                 lib_path = zlib_info.lib_paths[0]  # Just path, linux will find the right file
+            if self.settings.os == "Windows":
+                # clang-cl doesn't like backslashes in #define CFLAGS (builldinf.h -> cversion.c)
+                include_path = include_path.replace('\\', '/')
+                lib_path = lib_path.replace('\\', '/')
             config_options_string += ' --with-zlib-include="%s"' % include_path
             config_options_string += ' --with-zlib-lib="%s"' % lib_path
 
@@ -113,6 +130,8 @@ class OpenSSLConan(ConanFile):
         elif self.settings.os == "iOS":
             self.ios_build(config_options_string)
         elif self.settings.compiler == "Visual Studio":
+            self.visual_build(config_options_string)
+        elif self.settings.os == "Windows" and self.settings.compiler == "clang":
             self.visual_build(config_options_string)
         elif self.settings.os == "Windows" and self.settings.compiler == "gcc":
             self.mingw_build(config_options_string)
@@ -287,6 +306,15 @@ class OpenSSLConan(ConanFile):
         no_asm = "no-asm" if self.options.no_asm else ""
         # Will output binaries to ./binaries
         with tools.vcvars(self.settings, filter_known_paths=False):
+            if self.settings.compiler == 'clang':
+                cc = os.environ.get('CC', tools.which("clang-cl"))
+                tools.replace_in_file(os.path.join(self.subfolder, 'Configure'),
+                                      '"VC-WIN32","cl:', '"VC-WIN32","%s:' % cc)
+                tools.replace_in_file(os.path.join(self.subfolder, 'Configure'),
+                                      '"debug-VC-WIN32","cl:', '"VC-WIN32","%s:' % cc)
+                tools.replace_in_file(os.path.join(self.subfolder, 'util', 'pl', 'VC-32.pl'),
+                                      "$cc='cl'", "$cc='%s'" % cc)
+
             config_command = "perl Configure %s %s --prefix=../binaries" % (configure_type, no_asm)
             whole_command = "%s %s" % (config_command, config_options_string)
             self.output.warn(whole_command)
@@ -301,7 +329,7 @@ class OpenSSLConan(ConanFile):
                     self.run_in_src(r"ms\do_win64a")
                 else:
                     self.run_in_src(r"ms\do_ms")
-            runtime = self.settings.compiler.runtime
+            runtime = self._compiler_runtime
 
             # Replace runtime in ntdll.mak and nt.mak
             def replace_runtime_in_file(filename):
@@ -348,11 +376,19 @@ class OpenSSLConan(ConanFile):
             # tools.run_in_windows_bash(self, "make depend")
             tools.run_in_windows_bash(self, "make")
 
+    @property
+    def _is_msvc(self):
+        return self.settings.os == "Windows" and self.settings.compiler == "Visual Studio"
+
+    @property
+    def _is_clangcl(self):
+        return self.settings.os == "Windows" and self.settings.compiler == "clang"
+
     def package(self):
         # Copy the license files
         self.copy("%s/LICENSE" % self.subfolder, keep_path=False)
         self.copy(pattern="*applink.c", dst="include/openssl/", keep_path=False)
-        if self.settings.os == "Windows" and self.settings.compiler == "Visual Studio":
+        if self._is_msvc or self._is_clangcl:
             self._copy_visual_binaries()
             self.copy(pattern="*.h", dst="include/openssl/", src="binaries/include/", keep_path=False)
         elif self.settings.os == "Windows" and self.settings.compiler == "gcc":
@@ -380,15 +416,17 @@ class OpenSSLConan(ConanFile):
         self.copy(pattern="*.dll", dst="bin", src="binaries/bin", keep_path=False)
         self.copy(pattern="*.dll", dst="bin", src="binaries/bin", keep_path=False)
 
-        suffix = str(self.settings.compiler.runtime)
+        suffix = str(self._compiler_runtime)
         lib_path = os.path.join(self.package_folder, "lib")
         current_ssleay = os.path.join(lib_path, "ssleay32%s.lib" % suffix)
         current_libeay = os.path.join(lib_path, "libeay32%s.lib" % suffix)
-        os.rename(current_ssleay, os.path.join(lib_path, "ssleay32.lib"))
-        os.rename(current_libeay, os.path.join(lib_path, "libeay32.lib"))
+        if os.path.isfile(current_ssleay):
+            os.rename(current_ssleay, os.path.join(lib_path, "ssleay32.lib"))
+        if os.path.isfile(current_libeay):
+            os.rename(current_libeay, os.path.join(lib_path, "libeay32.lib"))
 
     def package_info(self):
-        if self.settings.compiler == "Visual Studio":
+        if self._is_msvc or self._is_clangcl:
             self.cpp_info.libs = ["ssleay32", "libeay32", "crypt32", "msi", "ws2_32"]
         elif self.settings.compiler == "gcc" and self.settings.os == "Windows":
             self.cpp_info.libs = ["ssl", "crypto", "ws2_32"]
